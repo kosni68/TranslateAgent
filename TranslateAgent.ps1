@@ -10,6 +10,55 @@ $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+function Write-Log {
+    param(
+        [Parameter(Mandatory=$true)][string]$Level,
+        [Parameter(Mandatory=$true)][string]$Message,
+        [ConsoleColor]$Color = [ConsoleColor]::Gray
+    )
+    $ts = Get-Date -Format "HH:mm:ss"
+    Write-Host "[$ts][$Level] $Message" -ForegroundColor $Color
+}
+
+function Ensure-STA {
+    $state = [System.Threading.Thread]::CurrentThread.ApartmentState
+    if ($state -ne "STA") {
+        Write-Log -Level "WARN" -Message "Current thread apartment state is $state. Relaunching in STA for clipboard/SendKeys." -Color Yellow
+        $args = @()
+        if ($PSCommandPath) {
+            $args += "-File"
+            $args += "`"$PSCommandPath`""
+        }
+        if ($args.Count -gt 0) {
+            if ($PSVersionTable.PSEdition -eq "Core") {
+                Start-Process -FilePath "pwsh" -ArgumentList @("-Sta") + $args
+            } else {
+                Start-Process -FilePath "powershell.exe" -ArgumentList @("-STA") + $args
+            }
+            exit 0
+        }
+    }
+}
+
+Ensure-STA
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class Win32 {
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+    public const uint KEYEVENTF_KEYUP = 0x0002;
+    public const byte VK_CONTROL = 0x11;
+    public const byte VK_C = 0x43;
+    public const byte VK_V = 0x56;
+}
+"@
+
 # C# code for global hotkey listener
 $csharp = @"
 using System;
@@ -99,12 +148,13 @@ function Resolve-LanguageName([string]$code) {
 
 function Get-LmStudioModel([string]$baseUrl) {
     try {
+        Write-Log -Level "INFO" -Message "Fetching LM Studio models from $baseUrl" -Color DarkCyan
         $resp = Invoke-RestMethod -Method GET -Uri "$baseUrl/v1/models" -TimeoutSec 5
         if ($resp.data -and $resp.data.Count -gt 0) {
             return [string]$resp.data[0].id
         }
     } catch {
-        Write-Host "Warning: Could not fetch models from LM Studio" -ForegroundColor Yellow
+        Write-Log -Level "WARN" -Message "Could not fetch models from LM Studio: $($_.Exception.Message)" -Color Yellow
     }
     return ""
 }
@@ -134,6 +184,7 @@ function Invoke-LmStudioTranslateAndCorrect {
         stream = $false
     } | ConvertTo-Json -Depth 6
 
+    Write-Log -Level "INFO" -Message "Sending request to LM Studio ($targetLangCode)" -Color DarkCyan
     $resp = Invoke-RestMethod -Method POST -Uri "$baseUrl/v1/chat/completions" -ContentType "application/json" -Body $body -TimeoutSec 30
     $out = $resp.choices[0].message.content
     return ($out -as [string]).Trim()
@@ -157,8 +208,69 @@ function Set-ClipboardText([string]$text) {
     }
 }
 
+function Set-ClipboardTextRobust([string]$text) {
+    $attempts = 0
+    do {
+        try {
+            [System.Windows.Forms.Clipboard]::SetText($text)
+            return $true
+        } catch {
+            try {
+                Set-Clipboard -Value $text -ErrorAction Stop
+                return $true
+            } catch {
+                $attempts++
+                Start-Sleep -Milliseconds 80
+            }
+        }
+    } while ($attempts -lt 6)
+    return $false
+}
+
 function Send-CtrlKey([string]$key) {
     [System.Windows.Forms.SendKeys]::SendWait("^{$key}")
+}
+
+function Send-CtrlC {
+    [Win32]::keybd_event([Win32]::VK_CONTROL, 0, 0, [UIntPtr]::Zero)
+    [Win32]::keybd_event([Win32]::VK_C, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 20
+    [Win32]::keybd_event([Win32]::VK_C, 0, [Win32]::KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+    [Win32]::keybd_event([Win32]::VK_CONTROL, 0, [Win32]::KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+}
+
+function Send-CtrlV {
+    [Win32]::keybd_event([Win32]::VK_CONTROL, 0, 0, [UIntPtr]::Zero)
+    [Win32]::keybd_event([Win32]::VK_V, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 20
+    [Win32]::keybd_event([Win32]::VK_V, 0, [Win32]::KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+    [Win32]::keybd_event([Win32]::VK_CONTROL, 0, [Win32]::KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+}
+
+function Get-SelectedText([string]$savedClip) {
+    $cleared = $false
+    if (Set-ClipboardTextRobust "") {
+        $cleared = $true
+        Write-Log -Level "DEBUG" -Message "Clipboard cleared before capture" -Color DarkGray
+    } else {
+        Write-Log -Level "WARN" -Message "Failed to clear clipboard before capture" -Color Yellow
+    }
+    Send-CtrlC
+    Start-Sleep -Milliseconds 80
+    $attempts = 0
+    do {
+        $current = Get-ClipboardText
+        if (-not [string]::IsNullOrEmpty($current)) {
+            if ($cleared -or $current -ne $savedClip) {
+            Write-Log -Level "DEBUG" -Message ("Clipboard updated, length: {0}" -f $current.Length) -Color DarkGray
+            return $current
+        }
+        }
+        $attempts++
+        Start-Sleep -Milliseconds 60
+    } while ($attempts -lt 12)
+    Write-Log -Level "WARN" -Message "Clipboard did not change after Ctrl+C. Selection may be missing or clipboard blocked." -Color Yellow
+    return ""
 }
 
 # Create invisible form for hotkey registration
@@ -169,45 +281,52 @@ $form.add_HotkeyTriggered({
     # Save current clipboard
     $savedClip = Get-ClipboardText
     
-    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Hotkey triggered!" -ForegroundColor Cyan
+    Write-Log -Level "INFO" -Message "Hotkey triggered" -Color Cyan
+    $targetHwnd = [Win32]::GetForegroundWindow()
+    if ($targetHwnd -ne [IntPtr]::Zero) {
+        [Win32]::SetForegroundWindow($targetHwnd) | Out-Null
+        Start-Sleep -Milliseconds 50
+        Write-Log -Level "DEBUG" -Message ("Restored foreground window: 0x{0:X}" -f $targetHwnd.ToInt64()) -Color DarkGray
+    } else {
+        Write-Log -Level "WARN" -Message "Could not get foreground window handle" -Color Yellow
+    }
     
     # Copy selection
-    Send-CtrlKey "c"
-    Start-Sleep -Milliseconds 150
-    $selected = Get-ClipboardText
+    Write-Log -Level "DEBUG" -Message "Sending Ctrl+C to capture selection" -Color DarkGray
+    $selected = Get-SelectedText -savedClip $savedClip
     
     if (-not [string]::IsNullOrWhiteSpace($selected)) {
         try {
-            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Processing text..." -ForegroundColor Yellow
+            Write-Log -Level "INFO" -Message ("Processing text ({0} chars)..." -f $selected.Length) -Color Yellow
             
             $translated = Invoke-LmStudioTranslateAndCorrect -baseUrl $BaseUrl -model $Model -targetLangCode $Lang -inputText $selected
             
             if (-not [string]::IsNullOrWhiteSpace($translated)) {
-                Set-ClipboardText $translated | Out-Null
+                Set-ClipboardTextRobust $translated | Out-Null
                 Start-Sleep -Milliseconds 50
-                Send-CtrlKey "v"
+                Send-CtrlV
                 Start-Sleep -Milliseconds 100
-                Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Done!" -ForegroundColor Green
+                Write-Log -Level "INFO" -Message "Done" -Color Green
             } else {
-                Set-ClipboardText $savedClip | Out-Null
+                Set-ClipboardTextRobust $savedClip | Out-Null
                 [console]::beep(400, 150)
-                Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Empty result" -ForegroundColor Yellow
+                Write-Log -Level "WARN" -Message "Empty result from model" -Color Yellow
             }
         }
         catch {
-            Set-ClipboardText $savedClip | Out-Null
+            Set-ClipboardTextRobust $savedClip | Out-Null
             [console]::beep(300, 100)
-            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ERROR: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Log -Level "ERROR" -Message $($_.Exception.Message) -Color Red
         }
     } else {
         [console]::beep(800, 100)
-        Write-Host "[$(Get-Date -Format 'HH:mm:ss')] No text selected" -ForegroundColor Yellow
+        Write-Log -Level "WARN" -Message "No text selected" -Color Yellow
     }
     
     # Restore clipboard
     if (-not [string]::IsNullOrWhiteSpace($savedClip)) {
         Start-Sleep -Milliseconds 50
-        Set-ClipboardText $savedClip | Out-Null
+        Set-ClipboardTextRobust $savedClip | Out-Null
     }
 })
 
@@ -216,8 +335,8 @@ $BaseUrl = "http://$HostIp`:$Port"
 # Auto-detect model
 $Model = Get-LmStudioModel -baseUrl $BaseUrl
 if ([string]::IsNullOrWhiteSpace($Model)) {
-    Write-Host "ERROR: Could not detect model from LM Studio at $BaseUrl" -ForegroundColor Red
-    Write-Host "Please ensure LM Studio is running with a model loaded." -ForegroundColor Yellow
+    Write-Log -Level "ERROR" -Message "Could not detect model from LM Studio at $BaseUrl" -Color Red
+    Write-Log -Level "WARN" -Message "Please ensure LM Studio is running with a model loaded." -Color Yellow
     exit 1
 }
 
