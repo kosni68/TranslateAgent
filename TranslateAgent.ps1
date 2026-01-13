@@ -20,6 +20,42 @@ function Write-Log {
     Write-Host "[$ts][$Level] $Message" -ForegroundColor $Color
 }
 
+function New-Stopwatch {
+    return [System.Diagnostics.Stopwatch]::StartNew()
+}
+
+function New-TimingSession {
+    return @{
+        Total = [System.Diagnostics.Stopwatch]::StartNew()
+        Last  = [System.Diagnostics.Stopwatch]::StartNew()
+    }
+}
+
+function Log-Time {
+    param(
+        [Parameter(Mandatory=$true)]$Timing,
+        [Parameter(Mandatory=$true)][string]$Message
+    )
+    $delta = $Timing.Last.ElapsedMilliseconds
+    $total = $Timing.Total.ElapsedMilliseconds
+    $Timing.Last.Restart()
+    Write-Host ("[+{0}ms | Total: {1}ms] {2}" -f $delta, $total, $Message) -ForegroundColor DarkCyan
+}
+
+function New-Stopwatch {
+    return [System.Diagnostics.Stopwatch]::StartNew()
+}
+
+function Stop-Log {
+    param(
+        [Parameter(Mandatory=$true)][System.Diagnostics.Stopwatch]$Stopwatch,
+        [Parameter(Mandatory=$true)][string]$Message,
+        [ConsoleColor]$Color = [ConsoleColor]::DarkCyan
+    )
+    $Stopwatch.Stop()
+    Write-Log -Level "TIME" -Message ("{0} ({1} ms)" -f $Message, $Stopwatch.ElapsedMilliseconds) -Color $Color
+}
+
 function Ensure-STA {
     $state = [System.Threading.Thread]::CurrentThread.ApartmentState
     if ($state -ne "STA") {
@@ -278,6 +314,7 @@ $form = New-Object HotkeyForm
 
 # Register hotkey event
 $form.add_HotkeyTriggered({
+    $timing = New-TimingSession
     # Save current clipboard
     $savedClip = Get-ClipboardText
     
@@ -294,18 +331,21 @@ $form.add_HotkeyTriggered({
     # Copy selection
     Write-Log -Level "DEBUG" -Message "Sending Ctrl+C to capture selection" -Color DarkGray
     $selected = Get-SelectedText -savedClip $savedClip
+    Log-Time -Timing $timing -Message "Capture selection"
     
     if (-not [string]::IsNullOrWhiteSpace($selected)) {
         try {
             Write-Log -Level "INFO" -Message ("Processing text ({0} chars)..." -f $selected.Length) -Color Yellow
             
             $translated = Invoke-LmStudioTranslateAndCorrect -baseUrl $BaseUrl -model $Model -targetLangCode $Lang -inputText $selected
+            Log-Time -Timing $timing -Message "LM Studio request"
             
             if (-not [string]::IsNullOrWhiteSpace($translated)) {
                 Set-ClipboardTextRobust $translated | Out-Null
                 Start-Sleep -Milliseconds 50
                 Send-CtrlV
                 Start-Sleep -Milliseconds 100
+                Log-Time -Timing $timing -Message "Paste result"
                 Write-Log -Level "INFO" -Message "Done" -Color Green
             } else {
                 Set-ClipboardTextRobust $savedClip | Out-Null
@@ -327,7 +367,9 @@ $form.add_HotkeyTriggered({
     if (-not [string]::IsNullOrWhiteSpace($savedClip)) {
         Start-Sleep -Milliseconds 50
         Set-ClipboardTextRobust $savedClip | Out-Null
+        Log-Time -Timing $timing -Message "Restore clipboard"
     }
+    Log-Time -Timing $timing -Message "Total hotkey workflow"
 })
 
 $BaseUrl = "http://$HostIp`:$Port"
