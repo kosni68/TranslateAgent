@@ -95,6 +95,43 @@ public static class Win32 {
 }
 "@
 
+function Prompt-StartupConfig {
+    param(
+        [string]$CurrentHostIp,
+        [int]$CurrentPort,
+        [string]$CurrentLang
+    )
+    Write-Host ""
+    Write-Host "=== Startup Configuration ===" -ForegroundColor Green
+    Write-Host "Press Enter to keep the current value." -ForegroundColor DarkGray
+
+    $hostInput = Read-Host "Host IP [$CurrentHostIp]"
+    if (-not [string]::IsNullOrWhiteSpace($hostInput)) {
+        $CurrentHostIp = $hostInput
+    }
+
+    $portInput = Read-Host "Port [$CurrentPort]"
+    if (-not [string]::IsNullOrWhiteSpace($portInput)) {
+        $parsed = 0
+        if ([int]::TryParse($portInput, [ref]$parsed)) {
+            $CurrentPort = $parsed
+        } else {
+            Write-Log -Level "WARN" -Message "Invalid port, keeping $CurrentPort" -Color Yellow
+        }
+    }
+
+    $langInput = Read-Host "Target language code [$CurrentLang]"
+    if (-not [string]::IsNullOrWhiteSpace($langInput)) {
+        $CurrentLang = $langInput.Trim()
+    }
+
+    return @{
+        HostIp = $CurrentHostIp
+        Port = $CurrentPort
+        Lang = $CurrentLang
+    }
+}
+
 # C# code for global hotkey listener
 $csharp = @"
 using System;
@@ -310,6 +347,11 @@ function Get-SelectedText([string]$savedClip) {
 }
 
 # Create invisible form for hotkey registration
+$config = Prompt-StartupConfig -CurrentHostIp $HostIp -CurrentPort $Port -CurrentLang $Lang
+$HostIp = $config.HostIp
+$Port = $config.Port
+$Lang = $config.Lang
+
 $form = New-Object HotkeyForm
 
 # Register hotkey event
