@@ -1,5 +1,5 @@
 param(
-    [string]$HostIp = "127.0.0.1",
+    [string]$HostIp = "10.197.0.121",
     [int]$Port = 1234,
     [string]$Lang = "de"
 )
@@ -219,17 +219,46 @@ function Resolve-LanguageName([string]$code) {
     }
 }
 
-function Get-LmStudioModel([string]$baseUrl) {
+function Get-LmStudioModels([string]$baseUrl) {
     try {
         Write-Log -Level "INFO" -Message "Fetching LM Studio models from $baseUrl" -Color DarkCyan
         $resp = Invoke-RestMethod -Method GET -Uri "$baseUrl/v1/models" -TimeoutSec 5
         if ($resp.data -and $resp.data.Count -gt 0) {
-            return [string]$resp.data[0].id
+            return @($resp.data | ForEach-Object { [string]$_.id })
         }
     } catch {
         Write-Log -Level "WARN" -Message "Could not fetch models from LM Studio: $($_.Exception.Message)" -Color Yellow
     }
-    return ""
+    return @()
+}
+
+function Select-ModelFromConsole {
+    param(
+        [Parameter(Mandatory=$true)][string]$baseUrl
+    )
+    $models = Get-LmStudioModels -baseUrl $baseUrl
+    if (-not $models -or $models.Count -eq 0) {
+        return ""
+    }
+
+    Write-Host ""
+    Write-Host "=== Model Selection ===" -ForegroundColor Green
+    for ($i = 0; $i -lt $models.Count; $i++) {
+        Write-Host ("[{0}] {1}" -f ($i + 1), $models[$i])
+    }
+    Write-Host "Press Enter to use the first model." -ForegroundColor DarkGray
+    $choice = Read-Host "Choose a model number"
+    if ([string]::IsNullOrWhiteSpace($choice)) {
+        return $models[0]
+    }
+    $parsed = 0
+    if ([int]::TryParse($choice, [ref]$parsed)) {
+        if ($parsed -ge 1 -and $parsed -le $models.Count) {
+            return $models[$parsed - 1]
+        }
+    }
+    Write-Log -Level "WARN" -Message "Invalid selection, using first model" -Color Yellow
+    return $models[0]
 }
 
 function Invoke-LmStudioTranslateAndCorrect {
@@ -416,8 +445,8 @@ $form.add_HotkeyTriggered({
 
 $BaseUrl = "http://$HostIp`:$Port"
 
-# Auto-detect model
-$Model = Get-LmStudioModel -baseUrl $BaseUrl
+# Choose model from available list
+$Model = Select-ModelFromConsole -baseUrl $BaseUrl
 if ([string]::IsNullOrWhiteSpace($Model)) {
     Write-Log -Level "ERROR" -Message "Could not detect model from LM Studio at $BaseUrl" -Color Red
     Write-Log -Level "WARN" -Message "Please ensure LM Studio is running with a model loaded." -Color Yellow
@@ -449,4 +478,3 @@ try {
 finally {
     $form.Dispose()
 }
-
